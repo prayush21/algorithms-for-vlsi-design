@@ -110,7 +110,7 @@ long long areaA = 0;
 long long areaB = 0;
 
 // Balancing ratio (10% by default)
-double ALLOWED_AREA_IMBALANCE_RATIO = 0.1;
+double ALLOWED_AREA_IMBALANCE_RATIO = 0.5;
 int P_MAX = -1;
 int max_gain_index = 0;
 int min_gain_index = 0;
@@ -350,6 +350,29 @@ void initPartition()
 // ----------------------------------------------------------
 int computeCutSize()
 {
+    // Re-init net Asize/Bsize
+    for (auto &np : net_map)
+    {
+        np.second.Asize = 0;
+        np.second.Bsize = 0;
+    }
+    // Fill them
+    for (const auto &cp : cell_map)
+    {
+        const auto &c = cp.second;
+        for (const auto &netId : c.net_list)
+        {
+            if (c.partition == 0)
+            {
+                net_map[netId].Asize++;
+            }
+            else
+            {
+                net_map[netId].Bsize++;
+            }
+        }
+    }
+
     int cut = 0;
     for (const auto &n : net_map)
     {
@@ -499,19 +522,112 @@ void printGainBucket()
 // ----------------------------------------------------------
 // 7) Single FM Pass
 // ----------------------------------------------------------
+// int runOnePass(int mlMode)
+// {
+//     int cutBefore = computeCutSize();
+//     int bestCut = cutBefore;
+//     int iter = 0;
+
+//     // Build the gain buckets
+//     initializeGainBuckets();
+
+//     // Takeing cell from max to min
+//     while (max_gain_index >= min_gain_index)
+//     {
+
+//         iter++;
+
+//         int currMaxGain = max_gain_index - P_MAX;
+//         auto &bucketList = gain_bucket[max_gain_index];
+
+//         if (bucketList.empty())
+//         {
+//             max_gain_index--;
+//             continue;
+//         }
+
+//         std::string targetCellId = bucketList.back();
+//         bucketList.pop_back();
+//         if (bucketList.empty())
+//         {
+//             max_gain_index--;
+//         }
+
+//         auto &targetCell = cell_map[targetCellId];
+//         if (targetCell.lock_status == 1)
+//         {
+//             // skip locked ones
+//             continue;
+//         }
+
+//         if (mlMode == 1)
+//         {
+//             double prob = mlScoreCell(targetCell);
+//             if (prob < 0.5)
+//             {
+//                 // lock and skip
+//                 targetCell.lock_status = 1;
+//                 continue;
+//             }
+//         }
+
+//         // Try moving if it keeps balance
+//         long long oldA = areaA;
+//         long long oldB = areaB;
+
+//         if (!canMoveCellBalanced(targetCellId))
+//         {
+//             // not feasible, lock & revert area
+//             targetCell.lock_status = 1;
+//             areaA = oldA;
+//             areaB = oldB;
+//             continue;
+//         }
+
+//         // Update and move
+//         updateGainsAfterMove(targetCellId);
+
+//         // Move the cell
+//         targetCell.lock_status = 1;
+//         int oldPartition = targetCell.partition;
+//         targetCell.partition = (oldPartition == 0) ? -1 : 0;
+
+//         // Update the cut
+//         int oldCut = cutBefore;
+//         cutBefore = cutBefore - targetCell.cell_gain;
+
+//         if (cutBefore < bestCut)
+//         {
+//             bestCut = cutBefore;
+//         }
+//     }
+//     return bestCut;
+// }
+
 int runOnePass(int mlMode)
 {
     int cutBefore = computeCutSize();
     int bestCut = cutBefore;
     int iter = 0;
 
+    // For rollback tracking
+    std::vector<std::string> moveSequence;
+    std::vector<int> cutHistory;
+    std::vector<long long> areaAHistory;
+    std::vector<long long> areaBHistory;
+    int bestMoveIndex = -1;
+
+    // Store initial state
+    cutHistory.push_back(cutBefore);
+    areaAHistory.push_back(areaA);
+    areaBHistory.push_back(areaB);
+
     // Build the gain buckets
     initializeGainBuckets();
 
-    // Takeing cell from max to min
+    // Taking cell from max to min
     while (max_gain_index >= min_gain_index)
     {
-
         iter++;
 
         int currMaxGain = max_gain_index - P_MAX;
@@ -533,7 +649,6 @@ int runOnePass(int mlMode)
         auto &targetCell = cell_map[targetCellId];
         if (targetCell.lock_status == 1)
         {
-            // skip locked ones
             continue;
         }
 
@@ -542,11 +657,13 @@ int runOnePass(int mlMode)
             double prob = mlScoreCell(targetCell);
             if (prob < 0.5)
             {
-                // lock and skip
                 targetCell.lock_status = 1;
                 continue;
             }
         }
+
+        // Store move for potential rollback
+        moveSequence.push_back(targetCellId);
 
         // Try moving if it keeps balance
         long long oldA = areaA;
@@ -554,7 +671,6 @@ int runOnePass(int mlMode)
 
         if (!canMoveCellBalanced(targetCellId))
         {
-            // not feasible, lock & revert area
             targetCell.lock_status = 1;
             areaA = oldA;
             areaB = oldB;
@@ -569,15 +685,42 @@ int runOnePass(int mlMode)
         int oldPartition = targetCell.partition;
         targetCell.partition = (oldPartition == 0) ? -1 : 0;
 
-        // Update the cut
-        int oldCut = cutBefore;
+        // Update the cut and store history
         cutBefore = cutBefore - targetCell.cell_gain;
+        cutHistory.push_back(cutBefore);
+        areaAHistory.push_back(areaA);
+        areaBHistory.push_back(areaB);
 
+        // Track best cut seen so far
         if (cutBefore < bestCut)
         {
+            // std::cout << "CB: " << cutBefore << " == (Computed) " << computeCutSize() << " , move_seq: " << moveSequence.size() - 1 << std::endl;
             bestCut = cutBefore;
+            bestMoveIndex = moveSequence.size() - 1;
         }
     }
+    // std::cout << "Computed:" << computeCutSize() << std::endl;
+    // Rollback to best state if needed
+    if (bestMoveIndex >= 0 && bestMoveIndex < moveSequence.size() - 1)
+    {
+        // Restore areas
+        areaA = areaAHistory[bestMoveIndex + 1];
+        areaB = areaBHistory[bestMoveIndex + 1];
+
+        std::cout << "Rollback to best move index: " << bestMoveIndex << std::endl;
+        std::cout << "Reverting " << moveSequence.size() - bestMoveIndex - 1 << " moves." << std::endl;
+        // Revert all moves after the best cut
+        for (int i = moveSequence.size() - 1; i > bestMoveIndex; i--)
+        {
+            auto &cellId = moveSequence[i];
+            auto &cell = cell_map[cellId];
+            // Flip partition back
+            cell.partition = (cell.partition == 0) ? -1 : 0;
+
+            cell.lock_status = 0;
+        }
+    }
+    // std::cout << "Computed:" << computeCutSize() << std::endl;
     return bestCut;
 }
 
@@ -809,7 +952,84 @@ void printPartition(const std::string &partitionName, bool showLockStatus = fals
     std::cout << std::endl;
 }
 
-// main()
+// Function to write the partition to a file
+void writePartitionToFile(const std::string &filename)
+{
+    std::ofstream fout(filename);
+    if (!fout.is_open())
+    {
+        std::cerr << "[ERROR] Cannot open file for writing: " << filename << std::endl;
+        return;
+    }
+
+    fout << "Partition A:\n";
+    for (const auto &cp : cell_map)
+    {
+        if (cp.second.partition == 0)
+        {
+            fout << cp.first << "\n";
+        }
+    }
+
+    fout << "Partition B:\n";
+    for (const auto &cp : cell_map)
+    {
+        if (cp.second.partition == -1)
+        {
+            fout << cp.first << "\n";
+        }
+    }
+
+    fout.close();
+    std::cout << "[INFO] Partition written to file: " << filename << std::endl;
+}
+
+// Function to read the partition from a file and compute the cut size
+int readPartitionFromFileAndComputeCutSize(const std::string &filename)
+{
+    std::ifstream fin(filename);
+    if (!fin.is_open())
+    {
+        std::cerr << "[ERROR] Cannot open file for reading: " << filename << std::endl;
+        return -1;
+    }
+
+    // Reset partitions
+    for (auto &cp : cell_map)
+    {
+        cp.second.partition = 0; // Default to Partition A
+    }
+
+    std::string line;
+    bool isPartitionB = false;
+
+    while (std::getline(fin, line))
+    {
+        if (line == "Partition A:")
+        {
+            isPartitionB = false;
+            continue;
+        }
+        else if (line == "Partition B:")
+        {
+            isPartitionB = true;
+            continue;
+        }
+
+        if (cell_map.find(line) != cell_map.end())
+        {
+            cell_map[line].partition = isPartitionB ? -1 : 0;
+        }
+    }
+
+    fin.close();
+
+    // Compute and return the cut size
+    int cutSize = computeCutSize();
+    return cutSize;
+}
+
+// Update main() to demonstrate the new functionality
 int main(int argc, char **argv)
 {
     if (argc < 5)
@@ -864,13 +1084,12 @@ int main(int argc, char **argv)
         {
             cp.second.lock_status = 0;
         }
-        // std::cout << " [PASS " << pass << "] Starting Pass..." << std::endl;
         int passCut = runOnePass(mlMode);
-
+        int computedCut = computeCutSize();
+        std::cout << passCut << " == " << computedCut << "(c)" << std::endl;
         if (passCut < bestCutGlobal)
         {
             bestCutGlobal = passCut;
-            // record new best partition
             bestAreaA = areaA;
             bestAreaB = areaB;
             for (const auto &cp : cell_map)
@@ -881,10 +1100,8 @@ int main(int argc, char **argv)
         }
         else
         {
-            // no improvement => revert to best partition and break
             std::cout << " [PASS " << pass << "] No improvement (cut=" << passCut
                       << "), revert & stop.\n";
-            // revert
             areaA = bestAreaA;
             areaB = bestAreaB;
             for (auto &cp : cell_map)
@@ -896,11 +1113,13 @@ int main(int argc, char **argv)
         }
     }
 
-    // Print Partition A:
-    // printPartition("A");
+    // Write the final partition to a file
+    std::string partitionFile = "final_partition.txt";
+    writePartitionToFile(partitionFile);
 
-    // Print Partition B:
-    // printPartition("B");
+    // Read the partition from the file and compute the cut size
+    int fileCutSize = readPartitionFromFileAndComputeCutSize(partitionFile);
+    // std::cout << "[INFO] Cut Size from File = " << fileCutSize << std::endl;
 
     // 6) Done. bestCutGlobal is the final cut.
     std::cout << "[INFO] Final Cut Size   = " << bestCutGlobal << std::endl;
@@ -914,7 +1133,6 @@ int main(int argc, char **argv)
     std::cout << "[INFO] Ending Partition at " << std::ctime(&endT) << std::endl;
     std::cout << "[INFO] Elapsed time: " << elapsedSec << " seconds" << std::endl;
 
-    // Counting cells in A/B
     long countA = 0, countB = 0;
     for (const auto &cp : bestPartitionRecord)
     {
@@ -928,3 +1146,123 @@ int main(int argc, char **argv)
 
     return 0;
 }
+
+// main()
+// int main(int argc, char **argv)
+// {
+//     if (argc < 5)
+//     {
+//         std::cerr << "Usage: " << argv[0]
+//                   << " <benchmarkName> <areaMode=1|2> <mlMode=0|1> <maxPasses>\n";
+//         std::cerr << "Example: " << argv[0] << " superblue18 2 1 5\n";
+//         return 1;
+//     }
+
+//     std::string benchmarkName = argv[1];
+//     int areaMode = std::stoi(argv[2]);  // 1 => all gates area=1, 2 => width*height
+//     int mlMode = std::stoi(argv[3]);    // 0 => ML off, 1 => ML on
+//     int maxPasses = std::stoi(argv[4]); // number of passes
+
+//     std::string nodeFile = benchmarkName + "/" + benchmarkName + ".nodes";
+//     std::string netFile = benchmarkName + "/" + benchmarkName + ".nets";
+
+//     auto startTP = std::chrono::system_clock::now();
+//     std::time_t startT = std::chrono::system_clock::to_time_t(startTP);
+//     std::cout << "[INFO] Starting Partition at " << std::ctime(&startT) << std::endl;
+
+//     // 1) Read Cells
+//     readCells(nodeFile, areaMode);
+
+//     // 2) Random Initial Partition
+//     initPartition();
+
+//     // 3) Read Nets
+//     readNets(netFile);
+
+//     // 4) Compute initial cut
+//     int currentCut = computeCutSize();
+//     bestCutGlobal = currentCut;
+//     bestAreaA = areaA;
+//     bestAreaB = areaB;
+
+//     // Save initial partition as best
+//     bestPartitionRecord.clear();
+//     for (const auto &cp : cell_map)
+//     {
+//         bestPartitionRecord[cp.first] = cp.second.partition;
+//     }
+
+//     std::cout << "[INFO] Initial Cut Size = " << currentCut << std::endl;
+
+//     // 5) Multi-pass FM
+//     for (int pass = 1; pass <= maxPasses; pass++)
+//     {
+//         // Unlock all cells
+//         for (auto &cp : cell_map)
+//         {
+//             cp.second.lock_status = 0;
+//         }
+//         // std::cout << " [PASS " << pass << "] Starting Pass..." << std::endl;
+//         int passCut = runOnePass(mlMode);
+
+//         if (passCut < bestCutGlobal)
+//         {
+//             bestCutGlobal = passCut;
+//             // record new best partition
+//             bestAreaA = areaA;
+//             bestAreaB = areaB;
+//             for (const auto &cp : cell_map)
+//             {
+//                 bestPartitionRecord[cp.first] = cp.second.partition;
+//             }
+//             std::cout << " [PASS " << pass << "] Improved Cut => " << passCut << std::endl;
+//         }
+//         else
+//         {
+//             // no improvement => revert to best partition and break
+//             std::cout << " [PASS " << pass << "] No improvement (cut=" << passCut
+//                       << "), revert & stop.\n";
+//             // revert
+//             areaA = bestAreaA;
+//             areaB = bestAreaB;
+//             for (auto &cp : cell_map)
+//             {
+//                 cp.second.partition = bestPartitionRecord[cp.first];
+//                 cp.second.lock_status = 0;
+//             }
+//             break;
+//         }
+//     }
+
+//     // Print Partition A:
+//     // printPartition("A");
+
+//     // Print Partition B:
+//     // printPartition("B");
+
+//     // 6) Done. bestCutGlobal is the final cut.
+//     std::cout << "[INFO] Final Cut Size   = " << bestCutGlobal << std::endl;
+//     std::cout << "[INFO] Final partition areas: A=" << bestAreaA
+//               << ", B=" << bestAreaB << std::endl;
+
+//     auto endTP = std::chrono::system_clock::now();
+//     std::time_t endT = std::chrono::system_clock::to_time_t(endTP);
+//     double elapsedSec = std::chrono::duration<double>(endTP - startTP).count();
+
+//     std::cout << "[INFO] Ending Partition at " << std::ctime(&endT) << std::endl;
+//     std::cout << "[INFO] Elapsed time: " << elapsedSec << " seconds" << std::endl;
+
+//     // Counting cells in A/B
+//     long countA = 0, countB = 0;
+//     for (const auto &cp : bestPartitionRecord)
+//     {
+//         if (cp.second == 0)
+//             countA++;
+//         else
+//             countB++;
+//     }
+//     std::cout << "[INFO] #Cells in A=" << countA
+//               << "  #Cells in B=" << countB << std::endl;
+
+//     return 0;
+// }
